@@ -18,6 +18,9 @@ package io.delta.kernelsharedtable
 
 import java.net.URI
 import java.nio.charset.StandardCharsets.UTF_8
+import java.sql.Timestamp
+import java.time.OffsetDateTime
+import java.time.format.{DateTimeFormatter, DateTimeParseException}
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 
@@ -30,11 +33,11 @@ import com.google.common.hash.Hashing
 import io.delta.kernel.Table
 import io.delta.kernel.defaults.engine.DefaultEngine
 import io.delta.kernel.engine.Engine
+import io.delta.kernel.exceptions.{KernelException, TableNotFoundException}
 import io.delta.kernel.internal.{ScanImpl, SnapshotImpl}
-import io.delta.standalone.DeltaLog
-import io.delta.standalone.internal.actions.{AddCDCFile, AddFile, Metadata, Protocol, RemoveFile}
-import io.delta.standalone.internal.exception.DeltaErrors
-import io.delta.standalone.internal.util.ConversionUtils
+import io.delta.kernel.internal.actions.{DeletionVectorDescriptor => KernelDeletionVectorDescriptor, Metadata => KernelMetadata, Protocol => KernelProtocol}
+import io.delta.kernel.internal.util.{InternalUtils, VectorUtils}
+import io.delta.storage.LogStore
 import org.apache.commons.codec.digest.DigestUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
@@ -45,10 +48,19 @@ import org.apache.spark.sql.types.{DataType, MetadataBuilder, StructType}
 import scalapb.{GeneratedMessage, GeneratedMessageCompanion}
 
 import io.delta.sharing.server.{AbfsFileSigner, CausedBy, DeltaSharedTableProtocol, DeltaSharingIllegalArgumentException, DeltaSharingUnsupportedOperationException, ErrorStrings, GCSFileSigner, PreSignedUrl, QueryResult, S3FileSigner, WasbFileSigner}
+import io.delta.sharing.server.actions.{ColumnMappingTableFeature, DeletionVectorsTableFeature, DeltaFormat, DeltaMetadata, DeltaProtocol, DeltaSingleAction}
 import io.delta.sharing.server.config.TableConfig
+import io.delta.sharing.server.model._
 import io.delta.sharing.server.protocol.{QueryTablePageToken, RefreshToken}
 import io.delta.sharing.server.util.JsonUtils
 
+
+
+object QueryTypes extends Enumeration {
+  type QueryType = Value
+
+  val QueryLatestSnapshot, QueryVersionSnapshot, QueryCDF, QueryStartingVersion = Value
+}
 
 /**
  * A util class stores all query parameters. Used to compute the checksum in the page token for
@@ -82,6 +94,22 @@ class DeltaSharedTableKernel(
 
   protected val tablePath: Path = new Path(tableConfig.getLocation)
 
+  /**
+   * Run `func` under the classloader of `DeltaSharedTable`. We cannot use the classloader set by
+   * Armeria as Hadoop needs to search the classpath to find its classes.
+   */
+  private def withClassLoader[T](func: => T): T = {
+    val classLoader = Thread.currentThread().getContextClassLoader
+    if (classLoader == null) {
+      Thread.currentThread().setContextClassLoader(this.getClass.getClassLoader)
+      try func finally {
+        Thread.currentThread().setContextClassLoader(null)
+      }
+    } else {
+      func
+    }
+  }
+
 
   // Get the table and table client (engine).
   // Uses the delta-kernel default implementation of link engine based on Hadoop APIs
@@ -90,22 +118,150 @@ class DeltaSharedTableKernel(
       new Configuration()
     )
     val table = Table.forPath(engine, tablePath.toString)
-
     (table, engine)
+  }
+
+  // Get the table snapshot of the specified version or timestamp
+  // TODO: Validate the protocol and metadata
+  private def getSharedTableSnapshot(
+                                      table: Table,
+                                      engine: Engine,
+                                      version: Option[Long],
+                                      timestamp: Option[String],
+                                      validStartVersion: Long,
+                                      clientReaderFeatures: Set[String],
+                                      flagReaderFeatures: Set[String] = Set.empty,
+                                      isProviderRpc: Boolean = false): SharedTableSnapshot = {
+    val snapshot =
+      if (version.isDefined) {
+        table.getSnapshotAsOfVersion(engine, version.get).asInstanceOf[SnapshotImpl]
+      } else if (timestamp.isDefined) {
+        table
+          .getSnapshotAsOfTimestamp(engine, millisSinceEpoch(timestamp.get))
+          .asInstanceOf[SnapshotImpl]
+      } else {
+        val classLoader = this.getClass.getClassLoader
+        Thread.currentThread().setContextClassLoader(classLoader)
+
+        table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      }
+
+    // Validate snapshot version, throw error if it's before the valid start version.
+    val snapshotVersion = snapshot.getVersion(engine)
+    if (snapshotVersion < validStartVersion) {
+      throw new DeltaSharingIllegalArgumentException(
+        "snapshotVersion must be greater than validStartVersion")
+    }
+
+    val protocol = snapshot.getProtocol
+    val metadata = snapshot.getMetadata
+
+    val updatedProtocol = if (clientReaderFeatures.isEmpty) {
+      // Client does not support advanced features.
+      // And after all the validation the table can be treated as having no advanced
+      // features/properties, hence we return a "fake" minReaderVersion=1, and cleanup
+      // the readerFeatures.
+      // Otherwise, we return the original protocol.
+      new KernelProtocol(
+        1,
+        if (protocol.getMinWriterVersion < 7) {
+          protocol.getMinWriterVersion
+        } else {
+          // minWriterVersion must be < 7 if writerFeatures are empty
+          // to bypass delta version check.
+          2
+        },
+        seqAsJavaList(Seq.empty[String]),
+        seqAsJavaList(Seq.empty[String])
+      )
+    } else {
+      protocol
+    }
+
+    // val versionStats =
+    //  loadVersionStats(snapshotVersion, clientReaderFeatures, flagReaderFeatures, isProviderRpc)
+
+    SharedTableSnapshot(
+      snapshotVersion,
+      updatedProtocol,
+      metadata,
+      // versionStats,
+      snapshot
+    )
+  }
+
+  private lazy val fullHistoryShared: Boolean =
+    tableConfig.historyShared && tableConfig.startVersion == 0L
+  private lazy val clientReaderFeatures = Set.empty
+  protected def allowedClientReaderFeatures(
+      inputFullHistoryShared: Boolean = fullHistoryShared,
+      clientReaderFeatures: Set[String]): Set[String] = {
+    clientReaderFeatures.filter { feature =>
+      if (inputFullHistoryShared) {
+        // All features are allowed when full history is shared.
+        true
+      } else {
+        // DV and CM are not allowed if full history is not shared.
+        // A table won't be shared with DV/CM enabled and without history, through the UC code path.
+        // This is a double check to avoid the following potential data leakage:
+        //  - User shares a regular table without history
+        //  - User enables DV/CM outside UC code path.
+        // scalastyle:off caselocale
+        !(feature.toLowerCase == DeletionVectorsTableFeature.name.toLowerCase ||
+          feature.toLowerCase == ColumnMappingTableFeature.name.toLowerCase)
+        // scalastyle:on caselocale
+      }
+    }
   }
 
 
   /** Get table version at or after startingTimestamp if it's provided, otherwise return
    *  the latest table version.
    */
-  override def getTableVersion(startingTimestamp: Option[String]): Long = {
+  override def getTableVersion(startingTimestamp: Option[String]): Long = withClassLoader {
     if (startingTimestamp.isDefined) {
-      throw new DeltaSharingIllegalArgumentException("starting timestamp not defined")
+      val (table, engine) = getTableAndEngine()
+      // If past snapshot exists, add one to the corresponding version.
+      // If the snapshot as of this version exists return it otherwise error.
+      // If the past snapshot does not exist return 0.
+      // If the starting timestamp is not defined, return the version with latest snapshot
+      try {
+        val snapshot = table.
+          getSnapshotAsOfTimestamp(engine, millisSinceEpoch(startingTimestamp.get))
+        val pastVersion = snapshot.getVersion(engine)
+
+        try {
+          table.getSnapshotAsOfVersion(engine, pastVersion + 1)
+          return pastVersion + 1
+        } catch {
+          case _: TableNotFoundException =>
+            // scalastyle:off println
+            System.out.println("table not found")
+            // scalastyle:on println
+            throw new DeltaSharingIllegalArgumentException("Not a valid starting timestamp")
+        }
+      } catch {
+        case e: DeltaSharingIllegalArgumentException =>
+          // scalastyle:off println
+          System.out.println("bad arg")
+          System.out.println(e)
+          // scalastyle:on println
+          throw e
+
+        case e: KernelException =>
+          if (e.getMessage.contains("Please use a timestamp greater than or equal")) {
+            return 0
+          }
+          // scalastyle:off println
+          System.out.println("kernel exception")
+          // scalastyle:on println
+          throw e
+
+      }
     } else {
       val (table, engine) = getTableAndEngine()
       val snapshot = table.getLatestSnapshot(engine)
-      snapshot.getVersion(engine)
-
+      return snapshot.getVersion(engine)
     }
   }
 
@@ -123,9 +279,63 @@ class DeltaSharedTableKernel(
       pageToken: Option[String],
       includeRefreshToken: Boolean,
       refreshToken: Option[String],
-      responseFormatSet: Set[String]): QueryResult = {
+      responseFormatSet: Set[String],
+      clientReaderFeaturesSet: Set[String] = Set.empty): QueryResult = {
 
-    throw new DeltaSharingUnsupportedOperationException("not implemented yet")
+    // throw new DeltaSharingUnsupportedOperationException("not implemented yet")
+    if (Seq(version, timestamp, startingVersion).filter(_.isDefined).size >= 2) {
+      throw new DeltaSharingIllegalArgumentException(
+        ErrorStrings.multipleParametersSetErrorMsg(Seq("version", "timestamp", "startingVersion"))
+      )
+    }
+
+    val refreshTokenOpt = refreshToken.map(decodeAndValidateRefreshToken)
+
+    val queryType = if (version.isDefined || timestamp.isDefined) {
+      QueryTypes.QueryVersionSnapshot
+    } else {
+      QueryTypes.QueryLatestSnapshot
+    }
+    val globalLimitHint = if (predicateHints.isEmpty && jsonPredicateHints.isEmpty) {
+      limitHint
+    } else {
+      None
+    }
+
+    val (table, engine) = getTableAndEngine()
+
+    val specifiedVersion = version.orElse(refreshTokenOpt.map(_.getVersion))
+    val snapshot = getSharedTableSnapshot(
+      table,
+      engine,
+      version.orElse(refreshTokenOpt.map(_.getVersion)),
+      timestamp,
+      validStartVersion = tableConfig.startVersion,
+      clientReaderFeatures =
+        allowedClientReaderFeatures(clientReaderFeatures = clientReaderFeaturesSet)
+    )
+
+    val respondedFormat = getRespondedFormat(
+      responseFormatSet,
+      includeFiles,
+      snapshot.protocol.getMinReaderVersion
+    )
+
+    val actions = Seq(
+      getResponseProtocol(snapshot.protocol, respondedFormat),
+      getResponseMetadata(snapshot.metadata, version = null, respondedFormat)
+    )
+
+    if (includeFiles) {
+      throw new DeltaSharingUnsupportedOperationException("not implemented yet")
+    }
+
+    QueryResult(snapshot.version, actions, respondedFormat)
+
+
+
+
+
 
   }
 
@@ -140,4 +350,199 @@ class DeltaSharedTableKernel(
 
   }
 
+  private def decodeAndValidateRefreshToken(tokenStr: String): RefreshToken = {
+    val token = try {
+      DeltaSharedTableKernel.decodeToken[RefreshToken](tokenStr)
+    } catch {
+      case NonFatal(_) =>
+        throw new DeltaSharingIllegalArgumentException(
+          s"Error decoding refresh token: $tokenStr."
+        )
+    }
+    if (token.getExpirationTimestamp < System.currentTimeMillis()) {
+      throw new DeltaSharingIllegalArgumentException(
+        "The refresh token has expired. Please restart the query."
+      )
+    }
+    if (token.getId != tableConfig.id) {
+      throw new DeltaSharingIllegalArgumentException(
+        "The table specified in the refresh token does not match the table being queried."
+      )
+    }
+    token
+  }
+
+
+  // Parse timestamp string and return the timestamp in milliseconds since epoch.
+  // Accepted format: DateTimeFormatter.ISO_OFFSET_DATE_TIME, example: 2022-01-01T00:00:00Z
+  private def millisSinceEpoch(timestamp: String): Long = {
+    try {
+      OffsetDateTime
+        .parse(timestamp, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+        .toInstant
+        .toEpochMilli
+    } catch {
+      case e: DateTimeParseException =>
+        try {
+          // TODO: stop supporting this format once all clients are migrated.
+          InternalUtils.microsSinceEpoch(Timestamp.valueOf(timestamp)) / 1000
+        } catch {
+          case _: IllegalArgumentException =>
+            throw new
+                DeltaSharingIllegalArgumentException(s"Invalid startingTimestamp: ${e.getMessage}.")
+        }
+    }
+  }
+
+  protected def getRespondedFormat(
+      responseFormatSet: Set[String],
+      includeFiles: Boolean,
+      minReaderVersion: Int): String = {
+    if (includeFiles) {
+      if (responseFormatSet.size != 1) {
+        // The protocol allows this, but we disallow this in the databricks server reduce the code
+        // complexity because there's no actual use case.
+        throw new DeltaSharingUnsupportedOperationException(
+          s"There can be only 1 responseFormat specified for queryTable or queryTableChanges RPC" +
+            s":${responseFormatSet.mkString(",")}."
+        )
+      }
+      responseFormatSet.head
+    } else {
+      // includeFiles is false, indicate the query is getTableMetadata.
+      if (responseFormatSet.size == 1) {
+        // Return as the requested format if there's only one format supported.
+        responseFormatSet.head
+      } else {
+        // the client can process both parquet and delta response, the server can decide the
+        // respondedFormat
+        if (minReaderVersion == 1 &&
+          responseFormatSet.contains(DeltaSharedTableKernel.RESPONSE_FORMAT_PARQUET)) {
+          // Use parquet as the respondedFormat when 1) it's getTableMetadata rpc 2) the flag is
+          // set to true 3) the requested format is delta,parquet 4) the shared table doesn't have
+          // advanced delta features.
+          DeltaSharedTableKernel.RESPONSE_FORMAT_PARQUET
+        } else {
+          DeltaSharedTableKernel.RESPONSE_FORMAT_DELTA
+        }
+      }
+    }
+  }
+
+
+  private def getResponseProtocol(
+      p: KernelProtocol,
+      respondedFormat: String): Object = {
+    if (respondedFormat == DeltaSharedTableKernel.RESPONSE_FORMAT_DELTA) {
+      val readerFeatures = if (p.getReaderFeatures.isEmpty) {
+        None
+      } else {
+        Some(p.getReaderFeatures.asScala.toSet)
+      }
+      val writerFeatures = if (p.getWriterFeatures.isEmpty) {
+        None
+      } else {
+        Some(p.getWriterFeatures.asScala.toSet)
+      }
+      DeltaFormatResponseProtocol(
+        deltaProtocol = DeltaProtocol(
+          minReaderVersion = p.getMinReaderVersion,
+          minWriterVersion = p.getMinWriterVersion,
+          readerFeatures = readerFeatures,
+          writerFeatures = writerFeatures
+        )
+      )
+    } else {
+      Protocol(p.getMinReaderVersion)
+    }
+  }
+
+  private def getResponseMetadata(
+      m: KernelMetadata,
+      version: java.lang.Long,
+      respondedFormat: String): Object = {
+    // We override the metadata.id to be the table ID instead of the randomly generated ID defined
+    // by the Delta Lake protocol. The table ID is a UUID that uniquely identifies a shared table on
+    // the delta sharing server.
+    if (respondedFormat == DeltaSharedTableKernel.RESPONSE_FORMAT_DELTA) {
+      DeltaResponseMetadata(
+        deltaMetadata = DeltaMetadataCopy(
+          id = tableConfig.id,
+          name = m.getName.orElse(null),
+          description = m.getDescription.orElse(null),
+          format = DeltaFormat(
+            provider = m.getFormat.getProvider,
+            options = m.getFormat.getOptions.asScala.toMap
+          ),
+          schemaString = m.getSchemaString,
+          partitionColumns = getPartitionColumns(m),
+          configuration = m.getConfiguration.asScala.toMap,
+          createdTime = Option(m.getCreatedTime.orElse(null))
+        ),
+        version = version
+      )
+    } else {
+      Metadata(
+        id = tableConfig.id,
+        name = m.getName.orElse(null),
+        description = m.getDescription.orElse(null),
+        format = Format(),
+        schemaString = cleanUpTableSchema(m.getSchemaString),
+        partitionColumns = getPartitionColumns(m),
+        configuration = getMetadataConfiguration(m.getConfiguration.asScala.toMap),
+        version = version
+      )
+    }
+  }
+
+  // Get the partition columns from Kernel Metadata.
+  private def getPartitionColumns(metadata: KernelMetadata): Seq[String] = {
+    VectorUtils.toJavaList[String](metadata.getPartitionColumns).asScala
+  }
+
+  // Get the table configuration for parquet format response.
+  // If the response is in parquet format, return enableChangeDataFeed config only.
+  private def getMetadataConfiguration(tableConf: Map[String, String]): Map[String, String ] = {
+    if (tableConfig.historyShared &&
+      tableConf.getOrElse("delta.enableChangeDataFeed", "false") == "true") {
+      Map("enableChangeDataFeed" -> "true")
+    } else {
+      Map.empty
+    }
+  }
+  private def cleanUpTableSchema(schemaString: String): String = {
+    StructType(DataType.fromJson(schemaString).asInstanceOf[StructType].map { field =>
+      val newMetadata = new MetadataBuilder()
+      // Only keep the column comment
+      if (field.metadata.contains("comment")) {
+        newMetadata.putString("comment", field.metadata.getString("comment"))
+      }
+      field.copy(metadata = newMetadata.build())
+    }).json
+  }
+
+
 }
+
+
+object DeltaSharedTableKernel {
+  val RESPONSE_FORMAT_PARQUET = "parquet"
+  val RESPONSE_FORMAT_DELTA = "delta"
+
+  private def encodeToken[T <: GeneratedMessage](token: T): String = {
+    Base64.getUrlEncoder.encodeToString(token.toByteArray)
+  }
+
+  private def decodeToken[T <: GeneratedMessage](tokenStr: String)(
+    implicit protoCompanion: GeneratedMessageCompanion[T]): T = {
+    protoCompanion.parseFrom(Base64.getUrlDecoder.decode(tokenStr))
+  }
+
+}
+
+private case class SharedTableSnapshot(
+    version: Long,
+    protocol: KernelProtocol,
+    metadata: KernelMetadata,
+    // versionStats: Option[VersionStats],
+    kernelSnapshot: SnapshotImpl)
